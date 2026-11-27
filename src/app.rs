@@ -3,6 +3,7 @@
 
 mod discover;
 mod help;
+mod lyrics;
 mod playlists;
 mod search;
 mod themes;
@@ -42,6 +43,7 @@ enum Msg {
     /// A cover finished turning into pixel art (keyed by its Plex thumb path).
     /// The third value is the width in columns it was made for.
     Art(String, usize, Result<PixelArt, String>),
+    Lyrics(lyrics::Loaded),
     Artists(Result<Vec<Artist>, String>),
     Albums(String, Result<Vec<Album>, String>),
     Tracks(String, Result<Vec<Track>, String>),
@@ -176,6 +178,7 @@ pub struct App {
     covers: Option<Covers>,
     /// Show the cover as pixel art in a taller now-playing area.
     album_art: bool,
+    lyrics: lyrics::Lyrics,
     truecolor: bool,
     art: Option<ArtSlot>,
     /// Width of the cover in columns, chosen so it looks square in this
@@ -279,6 +282,7 @@ impl App {
         group_releases: bool,
         mpris: bool,
         album_art: bool,
+        show_lyrics: bool,
     ) -> App {
         let (tx, rx) = mpsc::channel();
         let desktop_sound = matches!(target, crate::output::Target::SoundServer { .. });
@@ -303,6 +307,7 @@ impl App {
             mixer,
             covers,
             album_art,
+            lyrics: lyrics::Lyrics::new(show_lyrics),
             truecolor: pixelart::truecolor(),
             art: None,
             art_cols: art_columns(),
@@ -373,6 +378,9 @@ impl App {
                 Ok(())
             })?;
         self._companion = Some(receiver);
+        if let Some(reporter) = &self._reporter {
+            reporter.use_companion_queues();
+        }
         Ok(())
     }
 
@@ -403,7 +411,8 @@ impl App {
 
     /// Draws only when something on screen changes: a key, a resize, news
     /// from a background job, the player's status (the position to the half
-    /// second, so the clock and progress bar move), or a message timing out.
+    /// second, so the clock and progress bar move), a lyric line changing,
+    /// or a message timing out.
     /// Idle, Plext draws nothing; playing, about twice a second.
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let mut changed = true;
@@ -422,6 +431,9 @@ impl App {
             self.refresh_queue(&status);
             changed |= self.radio_tick(&status);
             changed |= self.search_tick();
+            let size = terminal.size()?;
+            let tall = self.tall_layout(size.width, size.height);
+            changed |= self.lyrics.tick(&self.server, &self.tx, &status, tall);
             // Cheap to ask, and the font size can change while we run.
             self.art_cols = art_columns();
             self.update_art(&status);
@@ -642,6 +654,7 @@ impl App {
                     };
                 }
             }
+            Msg::Lyrics(loaded) => self.lyrics.loaded(loaded),
             Msg::Artists(r) => {
                 self.artists = match r {
                     Ok(a) => Loadable::Ready(a),
@@ -1316,9 +1329,13 @@ impl App {
 
     // ---------- drawing ----------
 
+    fn tall_layout(&self, width: u16, height: u16) -> bool {
+        self.album_art && width >= TALL_MIN_W && height >= TALL_MIN_H
+    }
+
     fn draw(&mut self, f: &mut Frame, st: &Status) {
         let area = f.area();
-        let tall = self.album_art && area.width >= TALL_MIN_W && area.height >= TALL_MIN_H;
+        let tall = self.tall_layout(area.width, area.height);
         f.render_widget(Block::default().style(Style::default().fg(th().fg).bg(th().bg)), area);
         let outer = Layout::default()
             .direction(Direction::Vertical)
@@ -1378,7 +1395,8 @@ impl App {
             truecolor: self.truecolor,
             album_line: st.track.as_ref().map(|t| self.album_line(t)),
         });
-        draw_now_playing(f, outer[3], st, error, rating, art);
+        let lyric = self.lyrics.line(st).map(|(_, text)| text);
+        draw_now_playing(f, outer[3], st, error, rating, art, lyric);
         self.draw_keys(f, outer[4]);
         self.draw_modal(f);
     }
@@ -1818,12 +1836,11 @@ fn queue_line(num: &str, title: &str, artist: &str, album: &str, time: &str, wid
     let title_w = rest * 45 / 100;
     let artist_w = rest * 25 / 100;
     let album_w = rest - title_w - artist_w;
-    let col = |text: &str, w: usize| format!("{:<w$}", truncate(text, w.saturating_sub(2)));
     Line::from(vec![
         Span::styled(format!(" {:<num_w$}", truncate(num, num_w - 1)), styles[0]),
-        Span::styled(col(title, title_w), styles[1]),
-        Span::styled(col(artist, artist_w), styles[2]),
-        Span::styled(col(album, album_w), styles[3]),
+        Span::styled(table_column(title, title_w, 2), styles[1]),
+        Span::styled(table_column(artist, artist_w, 2), styles[2]),
+        Span::styled(table_column(album, album_w, 2), styles[3]),
         Span::styled(format!("{:>time_w$}", time), styles[4]),
     ])
 }
@@ -1863,15 +1880,15 @@ fn track_line(
     let fmt_w = 12;
     let time_w = 7;
     let title_w = width.saturating_sub(num_w + RATING_W + fmt_w + time_w + 2).max(8);
-    let rating_used: usize = rating.iter().map(|s| s.content.chars().count()).sum();
+    let rating_used: usize = rating.iter().map(Span::width).sum();
     let mut spans = vec![
         Span::styled(format!(" {:<num_w$}", truncate(num, num_w - 1)), styles[0]),
         // Leave a gap so a long title never runs into the stars.
-        Span::styled(format!("{:<title_w$}", truncate(title, title_w.saturating_sub(2))), styles[1]),
+        Span::styled(table_column(title, title_w, 2), styles[1]),
     ];
     spans.extend(rating);
     spans.push(Span::raw(" ".repeat(RATING_W.saturating_sub(rating_used))));
-    spans.push(Span::styled(format!("{:<fmt_w$}", truncate(fmt, fmt_w - 1)), styles[2]));
+    spans.push(Span::styled(table_column(fmt, fmt_w, 1), styles[2]));
     spans.push(Span::styled(format!("{:>time_w$}", time), styles[3]));
     Line::from(spans)
 }
@@ -1963,6 +1980,7 @@ fn draw_now_playing(
     error: Option<Banner>,
     rating: Option<Option<u8>>,
     art: Option<ArtView>,
+    lyric: Option<&str>,
 ) {
     let active = matches!(st.state, PlayState::Playing | PlayState::Paused | PlayState::Loading);
     let edge = if st.state == PlayState::Playing { th().accent } else if active { th().dim } else { th().border };
@@ -2101,8 +2119,16 @@ fn draw_now_playing(
         }
     }
 
-    // Row 3 and 6 stay blank around the progress bar (rows 4–5, which the
-    // waveform will fill; the bar sits on the lower one).
+    // One current lyric line, in the space above the progress bar.
+    if let Some(lyric) = lyric.filter(|_| track.is_some()) {
+        f.render_widget(
+            Paragraph::new(lyric)
+                .style(Style::default().fg(th().fg))
+                .alignment(Alignment::Center),
+            rows[3],
+        );
+    }
+    // Rows 4 and 6 leave breathing room around the progress bar.
     draw_progress(f, rows[5], st, false);
     draw_details_tall(f, rows[7], st, error);
 }
@@ -2486,17 +2512,35 @@ fn mmss(secs: f64) -> String {
     }
 }
 
+/// Fit a text column to terminal cells, including a gap before the next column.
+fn table_column(text: &str, width: usize, gap: usize) -> String {
+    let mut text = truncate(text, width.saturating_sub(gap));
+    let padding = width.saturating_sub(Span::raw(text.as_str()).width());
+    text.push_str(&" ".repeat(padding));
+    text
+}
+
+/// Truncate to terminal cells without splitting a grapheme (e.g. an accented letter).
 fn truncate(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        s.to_string()
-    } else if max <= 1 {
-        s.chars().take(max).collect()
-    } else {
-        let mut t: String = s.chars().take(max - 1).collect();
-        t.push('…');
-        t
+    let span = Span::raw(s);
+    if span.width() <= max {
+        return s.to_string();
     }
+    if max == 0 {
+        return String::new();
+    }
+    let mut text = String::new();
+    let mut used = 0;
+    for grapheme in span.styled_graphemes(Style::default()) {
+        let width = Span::raw(grapheme.symbol).width();
+        if used + width > max - 1 {
+            break;
+        }
+        text.push_str(grapheme.symbol);
+        used += width;
+    }
+    text.push('…');
+    text
 }
 
 #[cfg(test)]
@@ -2579,7 +2623,7 @@ mod tests {
             server_name: "Home".into(),
             library_title: "Music".into(),
         };
-        let mut app = App::new(server, "1".into(), header, crate::output::Target::Alsa("null".into()), false, true, false, false);
+        let mut app = App::new(server, "1".into(), header, crate::output::Target::Alsa("null".into()), false, true, false, false, true);
         let album = Album {
             key: "100".into(),
             title: "You Are Free".into(),
@@ -2605,7 +2649,7 @@ mod tests {
             queue: crate::plex::RemoteQueue {
                 info: crate::plex::RemoteQueueInfo { id: 7, version: 1 },
                 tracks: vec![track("2", 1, "Cast", None)], item_ids: vec![102], selected: 0, shuffled: false,
-            }, offset: 0.0,
+            }, offset: 0.0, paused: false,
         }, ack));
         done.recv_timeout(Duration::from_secs(3)).unwrap();
         assert!(app.when_loaded.is_empty());

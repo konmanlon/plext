@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.1
+
+### New
+
+- Show a single centered line of timed lyrics from Plex above the progress bar in the album
+  cover layout. Lyrics follow playback and seeking; unavailable or untimed lyrics stay blank.
+  Disabled by default; set `lyrics = true` to enable them. No external lyrics services are contacted.
+
+# Fixed
+
+- Fix Plexamp album casting starting at the first track instead of the selected track.
+- Fix column alignment in playlists, album track lists and queues by measuring text in
+  terminal display cells instead of counting characters. Chinese, Japanese and Korean text,
+  including mixed-script titles, artists and album names, now stays within its columns
+  without shifting later columns. Truncation also preserves complete combining characters
+  and emoji sequences.
+
 ## 1.1.0
 
 Plext can now serve as a remotely controlled music player on a headless device.

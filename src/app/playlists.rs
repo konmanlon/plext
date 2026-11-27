@@ -1114,12 +1114,11 @@ fn playlist_line(
     let rest = width.saturating_sub(num_w + RATING_W + time_w + 2).max(12);
     let title_w = rest * 58 / 100;
     let artist_w = rest - title_w;
-    let rating_used: usize = rating.iter().map(|s| s.content.chars().count()).sum();
-    let col = |text: &str, w: usize| format!("{:<w$}", truncate(text, w.saturating_sub(2)));
+    let rating_used: usize = rating.iter().map(Span::width).sum();
     let mut spans = vec![
         Span::styled(format!(" {:<num_w$}", truncate(num, num_w - 1)), styles[0]),
-        Span::styled(col(title, title_w), styles[1]),
-        Span::styled(col(artist, artist_w), styles[2]),
+        Span::styled(table_column(title, title_w, 2), styles[1]),
+        Span::styled(table_column(artist, artist_w, 2), styles[2]),
     ];
     spans.extend(rating);
     spans.push(Span::raw(" ".repeat(RATING_W.saturating_sub(rating_used))));

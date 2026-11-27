@@ -468,6 +468,7 @@ pub struct Server {
     pub base: String,
     pub token: String,
     pub machine_id: String,
+    queue_clients: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, String>>>,
 }
 
 /// A play queue created on the server, so Plex can track what we're playing.
@@ -516,13 +517,57 @@ pub struct Timeline<'a> {
 }
 
 impl Server {
+    /// Create a cast queue on our authenticated server, then load all windows.
+    /// Companion validates the source URI and only forwards queue parameters.
+    pub fn create_remote_queue(&self, args: &[(&str, String)]) -> Result<RemoteQueue> {
+        // PMS retires a client's previous audio queue on creation. Prepare
+        // each new queue under its own internal owner so the last published
+        // queue remains readable while controllers fetch the replacement.
+        // Cloning Plex shares connection pools and uses the existing token.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+        let mut owner = self.clone();
+        owner.plex.client_id = format!("{}-queue-{}-{}-{}", self.plex.client_id, epoch, std::process::id(), sequence);
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("type", "audio").append_pair("own", "1");
+        for (name, value) in args { query.append_pair(name, value); }
+        let response = owner.send("POST", &format!("/playQueues?{}", query.finish()))?;
+        let id = &response["MediaContainer"]["playQueueID"];
+        let id = id.as_u64().or_else(|| id.as_str().and_then(|s| s.parse().ok()))
+            .context("missing play queue ID")?;
+        self.queue_clients.lock().unwrap().insert(id, owner.plex.client_id);
+        self.remote_queue(id)
+    }
+
+    fn queue_owner(&self, id: u64) -> Self {
+        let mut owner = self.clone();
+        if let Some(client) = self.queue_clients.lock().unwrap().get(&id) {
+            owner.plex.client_id = client.clone();
+        }
+        owner
+    }
+
+    pub fn queue_exists(&self, id: u64) -> Result<bool> {
+        let owner = self.queue_owner(id);
+        let url = owner.url(&format!("/playQueues/{}?own=0&window=1", id))?;
+        match owner.plex.req("GET", &url, Some(&owner.token)).timeout(Duration::from_secs(3)).call() {
+            Err(ureq::Error::Status(404, _)) => {
+                self.queue_clients.lock().unwrap().remove(&id);
+                Ok(false)
+            }
+            response => { response.checked()?; Ok(true) }
+        }
+    }
+
     /// Fetch every window in server order. In particular, never treat the
     /// first (possibly centered) window as the complete cast playlist.
     pub fn remote_queue(&self, id: u64) -> Result<RemoteQueue> {
+        let owner = self.queue_owner(id);
         let page = |center: Option<u64>, before: bool, after: bool| -> Result<Value> {
             let mut path = format!("/playQueues/{}?own=1&window=200&includeBefore={}&includeAfter={}", id, u8::from(before), u8::from(after));
             if let Some(c) = center { path.push_str(&format!("&center={}", c)); }
-            self.get(&path)
+            owner.get(&path)
         };
         let first = page(None, true, true)?;
         let mc = &first["MediaContainer"];
@@ -576,7 +621,7 @@ impl Server {
     }
 
     pub fn shuffle_remote_queue(&self, id: u64, on: bool) -> Result<RemoteQueue> {
-        self.send("PUT", &format!("/playQueues/{}/{}", id, if on { "shuffle" } else { "unshuffle" }))?;
+        self.queue_owner(id).send("PUT", &format!("/playQueues/{}/{}", id, if on { "shuffle" } else { "unshuffle" }))?;
         self.remote_queue(id)
     }
     pub fn new(plex: Plex, base: &str, token: &str, machine_id: &str) -> Server {
@@ -585,6 +630,7 @@ impl Server {
             base: base.trim_end_matches('/').to_string(),
             token: token.to_string(),
             machine_id: machine_id.to_string(),
+            queue_clients: Default::default(),
         }
     }
 
@@ -864,6 +910,39 @@ impl Server {
         let v = self.get(&format!("/library/metadata/{}", encode(key)))?;
         let t = items(&v, "Metadata").next().map(parse_track);
         t.ok_or_else(|| anyhow!("track {} not found", key))
+    }
+
+    /// Read lyrics only from streams advertised by this Plex server. Never
+    /// search another provider or follow an external URL supplied in metadata.
+    pub fn lyrics(&self, key: &str) -> Result<Option<crate::lyrics::Lyrics>> {
+        let v = self.get(&format!("/library/metadata/{}", encode(key)))?;
+        let Some(streams) = items(&v, "Metadata").next()
+            .and_then(|m| m.pointer("/Media/0/Part/0/Stream"))
+            .and_then(Value::as_array) else { return Ok(None) };
+        let mut streams: Vec<_> = streams.iter().filter(|s| {
+            let kind = s["streamType"].as_u64().or_else(|| s["streamType"].as_str()?.parse().ok());
+            kind == Some(4) && s["key"].as_str().is_some_and(|k| k.starts_with('/'))
+        }).collect();
+        // Prefer timed streams, while also accepting LRC on older servers
+        // that do not set the `timed` flag.
+        streams.sort_by_key(|s| std::cmp::Reverse(
+            s["timed"] == true || s["timed"] == 1 || s["timed"] == "1"
+                || s["format"].as_str().is_some_and(|f| f.eq_ignore_ascii_case("lrc"))
+        ));
+        for stream in streams {
+            let url = self.url(stream["key"].as_str().unwrap())?;
+            let response = self.plex.req("GET", &url, Some(&self.token))
+                .timeout(Duration::from_secs(10)).call().checked()?;
+            // Bound memory use even if a stream accidentally points at media.
+            const MAX_BYTES: u64 = 1024 * 1024;
+            let mut body = String::new();
+            response.into_reader().take(MAX_BYTES + 1).read_to_string(&mut body)?;
+            if body.len() as u64 > MAX_BYTES { bail!("Plex lyrics are too large"); }
+            if let Some(lyrics) = crate::lyrics::Lyrics::parse(&body) {
+                return Ok(Some(lyrics));
+            }
+        }
+        Ok(None)
     }
 
     // ---------- search ----------

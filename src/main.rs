@@ -8,6 +8,7 @@ mod inspect;
 mod inspect_mixes;
 mod inspect_search;
 mod log;
+mod lyrics;
 mod mpris;
 mod output;
 mod pixelart;
@@ -297,6 +298,7 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
         cfg.group_releases.unwrap_or(true),
         cfg.mpris.unwrap_or(true),
         cfg.album_art.unwrap_or(true),
+        cfg.lyrics.unwrap_or(false),
     );
     app.use_theme(cfg.theme_settings());
     app.restore_queue();

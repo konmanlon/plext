@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 use url::Url;
 
-const CAPABILITIES: &str = "timeline,playback,playqueues";
+const CAPABILITIES: &str = "timeline,playback,playqueues,playqueues-creation";
 const TTL: Duration = Duration::from_secs(90);
 const MAX_CONTROLLERS: usize = 64;
 const GDM_GROUP: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 0, 0, 250), 32413);
@@ -93,6 +93,9 @@ struct State {
     controllers: Mutex<HashMap<String, Controller>>,
     /// Serialize mutations and duplicate checks across HTTP workers.
     commands: Mutex<()>,
+    last_export: Mutex<Option<(u64, Instant)>>,
+    published_status: Mutex<Option<Status>>,
+    last_queue_check: Mutex<Option<(u64, Instant)>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -128,6 +131,9 @@ impl Companion {
             dispatch: Arc::new(dispatch),
             controllers: Mutex::new(HashMap::new()),
             commands: Mutex::new(()),
+            last_export: Mutex::new(None),
+            published_status: Mutex::new(None),
+            last_queue_check: Mutex::new(None),
             stop: stop.clone(),
         });
         let mut receiver = Self {
@@ -244,7 +250,8 @@ impl State {
             .filter(|s| !s.is_empty() && s.len() <= 256)
             .ok_or_else(|| (400, "X-Plex-Client-Identifier is required".into()))?;
         let command_id = optional_number(&p, "commandID").map_err(bad_request)?;
-        if p.get("type").is_some_and(|t| t != "music") {
+        let creating_queue = url.path() == "/player/playback/createPlayQueue";
+        if p.get("type").is_some_and(|t| t != "music" && !(creating_queue && t == "audio")) {
             return fail(400, "only music is supported");
         }
         match url.path() {
@@ -363,6 +370,8 @@ impl State {
     }
 
     fn playback(&self, path: &str, p: &Params) -> Result<()> {
+        #[cfg(debug_assertions)]
+        debug_request(path, p);
         let send = |cmd| (self.dispatch)(cmd);
         match path {
             "/player/playback/play" => send(Cmd::Resume),
@@ -443,8 +452,47 @@ impl State {
                 send(Cmd::RefreshRemote(self.server.remote_queue(id)?))
             }
             "/player/playback/playMedia" => self.play_media(p),
+            "/player/playback/createPlayQueue" => self.create_play_queue(p),
             _ => bail!("unsupported playback operation"),
         }
+    }
+
+    fn create_play_queue(&self, p: &Params) -> Result<()> {
+        if p.get("machineIdentifier").is_some_and(|id| id != &self.server.machine_id) {
+            bail!("use the configured server");
+        }
+        let offset = optional_number(p, "offset")?.unwrap_or(0) as f64 / 1000.0;
+        let paused = optional_flag(p, "paused")?.unwrap_or(false);
+        let mut args = Vec::new();
+        // Plexamp's generated mixes send a filtered URI plus a placeholder
+        // playlistID (e.g. "undefined"), rather than a saved numeric playlist.
+        if let Some(id) = p.get("playlistID").and_then(|s| s.parse::<u64>().ok()).filter(|id| *id > 0) {
+            args.push(("playlistID", id.to_string()));
+        } else if let Some(uri) = p.get("uri") {
+            validate_queue_uri(uri, &self.server.machine_id)?;
+            args.push(("uri", uri.clone()));
+        }
+        if args.is_empty() {
+            bail!("missing queue URI or playlist ID");
+        }
+        if let Some(key) = p.get("key") {
+            args.push(("key", format!("/library/metadata/{}", media_id(key)?)));
+        }
+        for name in ["shuffle", "repeat", "continuous", "includeChapters", "includeRelated"] {
+            if let Some(value) = optional_flag(p, name)? {
+                args.push((name, u8::from(value).to_string()));
+            }
+        }
+        // Use the existing authenticated server, never request-supplied
+        // address/protocol/port/token values.
+        let queue = self.server.create_remote_queue(&args)?;
+        if queue.tracks.is_empty() {
+            bail!("empty cast queue");
+        }
+        #[cfg(debug_assertions)]
+        debug(&format!("created queue={} count={} selected_index={} selected_key={} paused={}",
+            queue.info.id, queue.tracks.len(), queue.selected, queue.tracks[queue.selected].key, paused));
+        (self.dispatch)(Cmd::PlayRemote { queue, offset, paused })
     }
 
     fn play_media(&self, p: &Params) -> Result<()> {
@@ -462,22 +510,28 @@ impl State {
                 if pq.tracks.is_empty() {
                     bail!("empty cast queue");
                 }
+                #[cfg(debug_assertions)]
+                debug(&format!(
+                    "loaded queue={} version={} count={} selected_index={} selected_key={} selected_item={}",
+                    pq.info.id, pq.info.version, pq.tracks.len(), pq.selected,
+                    pq.tracks[pq.selected].key, pq.item_ids[pq.selected]
+                ));
+                // PMS's selected item is authoritative. Plexamp may supply
+                // the album's first track as `key` even when another track
+                // was tapped; only an explicit queue item overrides PMS.
                 if let Some(item) = optional_number(p, "playQueueItemID")? {
                     pq.selected = pq
                         .item_ids
                         .iter()
                         .position(|i| *i == item)
                         .context("item not in queue")?;
-                } else if let Some(key) = &key {
-                    if pq.tracks[pq.selected].key != *key {
-                        pq.selected = pq
-                            .tracks
-                            .iter()
-                            .position(|t| t.key == *key)
-                            .context("track not in queue")?;
-                    }
                 }
-                return (self.dispatch)(Cmd::PlayRemote { queue: pq, offset });
+                #[cfg(debug_assertions)]
+                debug(&format!(
+                    "dispatch remote index={} key={} item={} offset_seconds={}",
+                    pq.selected, pq.tracks[pq.selected].key, pq.item_ids[pq.selected], offset
+                ));
+                return (self.dispatch)(Cmd::PlayRemote { queue: pq, offset, paused: false });
             }
             if let Some(album) = container
                 .strip_prefix("/library/metadata/")
@@ -491,6 +545,13 @@ impl State {
                 if tracks.is_empty() {
                     bail!("empty album");
                 }
+                #[cfg(debug_assertions)]
+                debug(&format!(
+                    "dispatch album={} count={} requested_key={:?} matched={} index={} key={} offset_seconds={}",
+                    album, tracks.len(), key,
+                    key.as_ref().is_some_and(|k| tracks.iter().any(|t| t.key == *k)),
+                    index, tracks[index].key, offset
+                ));
                 return (self.dispatch)(Cmd::PlayAt {
                     queue: tracks,
                     index,
@@ -515,7 +576,7 @@ impl State {
     }
 
     fn timeline(&self, command_id: u64, disconnected: bool) -> String {
-        let st = self.status.lock().unwrap().clone();
+        let st = self.controller_status();
         let state = match st.state {
             PlayState::Stopped => "stopped",
             PlayState::Loading => "buffering",
@@ -528,7 +589,7 @@ impl State {
         if self.mixer.is_some() {
             controllable.push_str(",volume");
         }
-        let mut attrs = format!("type=\"music\" state=\"{}\" controllable=\"{}\" time=\"{}\" shuffle=\"{}\" repeat=\"{}\"",
+        let mut attrs = format!("type=\"music\" itemType=\"music\" state=\"{}\" controllable=\"{}\" time=\"{}\" shuffle=\"{}\" repeat=\"{}\"",
             state, controllable, milliseconds(st.pos), u8::from(st.shuffle), match st.repeat { Repeat::Off => 0, Repeat::One => 1, Repeat::All => 2 });
         if let Some(dur) = st.dur {
             attrs.push_str(&format!(" duration=\"{}\"", milliseconds(dur)));
@@ -543,7 +604,7 @@ impl State {
         if st.state != PlayState::Stopped {
             if let Some(t) = st.track {
                 attrs.push_str(&format!(
-                    " ratingKey=\"{}\" key=\"/library/metadata/{}\" machineIdentifier=\"{}\"",
+                    " ratingKey=\"{}\" key=\"/library/metadata/{}\" machineIdentifier=\"{}\" providerIdentifier=\"com.plexapp.plugins.library\"",
                     xml(&t.key),
                     xml(&t.key),
                     xml(&self.server.machine_id)
@@ -564,6 +625,25 @@ impl State {
         format!("<MediaContainer commandID=\"{}\" location=\"fullScreenMusic\"{}><Timeline {}/><Timeline type=\"video\" state=\"stopped\"/><Timeline type=\"photo\" state=\"stopped\"/></MediaContainer>", command_id, if disconnected { " disconnected=\"1\"" } else { "" }, attrs)
     }
 
+    fn controller_status(&self) -> Status {
+        let current = self.status.lock().unwrap().clone();
+        let mut published = self.published_status.lock().unwrap();
+        if current.state == PlayState::Stopped {
+            *published = None;
+        } else if current.remote.is_none() {
+            // A local selection is audible before its new PMS queue is ready.
+            // Keep one coherent item/queue pair as buffering until binding
+            // finishes, instead of making controllers tear down a partial item.
+            let mut visible = published.clone().unwrap_or_else(|| current.clone());
+            visible.state = PlayState::Loading;
+            visible.volume = current.volume;
+            return visible;
+        } else {
+            *published = Some(current.clone());
+        }
+        current
+    }
+
     fn event_signature(&self) -> String {
         let s = self.status.lock().unwrap();
         format!(
@@ -580,6 +660,59 @@ impl State {
         )
     }
 
+    fn sync_local_queue(&self) -> Result<()> {
+        let status = self.status.lock().unwrap().clone();
+        if status.remote.is_some() || status.track.is_none()
+            || !matches!(status.state, PlayState::Playing | PlayState::Paused) {
+            return Ok(());
+        }
+        let view = self.queue.view();
+        if view.items.is_empty() || status.track.as_ref().map(|t| &t.key)
+            != view.items.get(view.pos).map(|e| &e.track.key) {
+            return Ok(());
+        }
+        {
+            let mut last = self.last_export.lock().unwrap();
+            if last.as_ref().is_some_and(|(version, when)| *version == view.version && when.elapsed() < Duration::from_secs(10)) {
+                return Ok(());
+            }
+            *last = Some((view.version, Instant::now()));
+        }
+        let keys = view.items.iter().map(|e| e.track.key.as_str()).collect::<Vec<_>>().join(",");
+        let uri = format!("server://{}/com.plexapp.plugins.library/library/metadata/{}", self.server.machine_id, keys);
+        let queue = self.server.create_remote_queue(&[
+            ("uri", uri), ("shuffle", "0".into()), ("continuous", "0".into()),
+            ("includeRelated", "0".into()),
+            ("key", format!("/library/metadata/{}", view.items[view.pos].track.key)),
+        ])?;
+        #[cfg(debug_assertions)]
+        debug(&format!("exported local queue={} count={} local_version={}", queue.info.id, queue.tracks.len(), view.version));
+        (self.dispatch)(Cmd::BindRemote { queue, expected_version: view.version })
+    }
+
+    fn check_published_queue(&self) -> Result<()> {
+        let status = self.status.lock().unwrap().clone();
+        if status.state == PlayState::Stopped { return Ok(()); }
+        let Some(remote) = status.remote else { return Ok(()); };
+        {
+            let mut last = self.last_queue_check.lock().unwrap();
+            if last.as_ref().is_some_and(|(id, when)| *id == remote.info.id && when.elapsed() < Duration::from_secs(5)) {
+                return Ok(());
+            }
+            *last = Some((remote.info.id, Instant::now()));
+        }
+        if !self.server.queue_exists(remote.info.id)? {
+            #[cfg(debug_assertions)]
+            debug(&format!("queue={} expired on PMS; rebuilding from local playback", remote.info.id));
+            (self.dispatch)(Cmd::InvalidateRemote(remote.info.id))?;
+            let mut published = self.published_status.lock().unwrap();
+            if published.as_ref().and_then(|s| s.remote.as_ref()).map(|q| q.info.id) == Some(remote.info.id) {
+                *published = None;
+            }
+        }
+        Ok(())
+    }
+
     fn push_timelines(&self) {
         let agent = ureq::AgentBuilder::new()
             .redirects(0)
@@ -588,6 +721,18 @@ impl State {
             .build();
         loop {
             let quitting = self.stop.load(Ordering::Relaxed);
+            if !quitting && !self.controllers.lock().unwrap().is_empty() {
+                // Runs on this network worker. The audio/UI threads only
+                // receive the finished snapshot, guarded by its local version.
+                if self.check_published_queue().is_err() {
+                    #[cfg(debug_assertions)]
+                    debug("could not check the published queue; keeping playback");
+                }
+                if self.sync_local_queue().is_err() {
+                    #[cfg(debug_assertions)]
+                    debug("could not export the local queue; will retry");
+                }
+            }
             let targets: Vec<_> = {
                 let mut clients = self.controllers.lock().unwrap();
                 clients.retain(|_, c| c.seen.elapsed() < TTL);
@@ -656,8 +801,87 @@ fn optional_number(p: &Params, name: &str) -> Result<Option<u64>> {
         })
         .transpose()
 }
+
+// Debug-build-only diagnostics: never log raw request URLs, headers, or tokens.
+#[cfg(debug_assertions)]
+fn debug(message: &str) {
+    if std::env::var("PLEXT_COMPANION_DEBUG").as_deref() == Ok("1") {
+        crate::log::write(&format!("companion debug: {}", message));
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_request(path: &str, p: &Params) {
+    if std::env::var("PLEXT_COMPANION_DEBUG").as_deref() != Ok("1") {
+        return;
+    }
+    let mut fields: Vec<_> = p.keys().collect();
+    fields.sort();
+    let mut values = Vec::new();
+    for name in ["commandID", "offset", "playQueueID", "playQueueItemID", "playQueueVersion",
+        "playQueueSelectedItemOffset", "index", "startIndex", "shuffle", "repeat"] {
+        if p.contains_key(name) {
+            values.push(format!("{}={:?}", name, optional_number(p, name).ok().flatten()));
+        }
+    }
+    let key = p.get("key").map(|s| media_id(s).ok());
+    let container = p.get("containerKey").map(|s| {
+        let path = s.split('?').next().unwrap_or(s);
+        if path.strip_prefix("/playQueues/").is_some_and(|s| digits(s).is_ok())
+            || path.strip_prefix("/library/metadata/")
+                .and_then(|s| s.strip_suffix("/children")).is_some_and(|s| digits(s).is_ok()) {
+            path
+        } else {
+            "<unsupported container>"
+        }
+    });
+    debug(&format!("request={} fields={:?} key={:?} container={:?} {}",
+        path, fields, key, container, values.join(" ")));
+}
+
 fn required_number(p: &Params, name: &str) -> Result<u64> {
     optional_number(p, name)?.with_context(|| format!("missing {}", name))
+}
+fn optional_flag(p: &Params, name: &str) -> Result<Option<bool>> {
+    optional_number(p, name)?.map(|n| match n {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => bail!("{} must be 0 or 1", name),
+    }).transpose()
+}
+
+fn validate_queue_uri(uri: &str, machine_id: &str) -> Result<()> {
+    let path = if let Some(path) = uri.strip_prefix(&format!(
+        "server://{}/com.plexapp.plugins.library", machine_id
+    )).or_else(|| uri.strip_prefix("server:///com.plexapp.plugins.library")) {
+        path.to_owned()
+    } else if let Some(path) = uri.strip_prefix("library://").and_then(|s| s.split_once("/directory/").map(|(_, path)| path)) {
+        // Library list URIs encode the entire metadata path inside the URI.
+        url::form_urlencoded::parse(format!("path={}", path).as_bytes())
+            .next().context("missing library path")?.1.into_owned()
+    } else {
+        bail!("use a music URI from the configured server");
+    };
+    let url = Url::parse(&format!("http://library{}", path))?;
+    if url.host_str() != Some("library") || url.fragment().is_some() || path.contains("..") {
+        bail!("invalid library source path");
+    }
+    let path = url.path();
+    if let Some(ids) = path.strip_prefix("/library/metadata/") {
+        let (ids, suffix) = ids.split_once('/').unwrap_or((ids, ""));
+        for id in ids.split(',') { digits(id)?; }
+        if !matches!(suffix, "" | "children" | "allLeaves" | "station") {
+            bail!("unsupported metadata source");
+        }
+    } else if let Some(id) = path.strip_prefix("/playlists/") {
+        digits(id.strip_suffix("/items").unwrap_or(id))?;
+    } else if let Some((section, endpoint)) = path.strip_prefix("/library/sections/").and_then(|s| s.split_once('/')) {
+        digits(section)?;
+        if endpoint != "all" { bail!("unsupported library source"); }
+    } else {
+        bail!("unsupported music queue URI");
+    }
+    Ok(())
 }
 fn digits(s: &str) -> Result<&str> {
     if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
@@ -806,6 +1030,9 @@ mod tests {
                 dispatch: Arc::new(move |cmd| tx.send(cmd).map_err(|_| anyhow::anyhow!("closed"))),
                 controllers: Mutex::new(HashMap::new()),
                 commands: Mutex::new(()),
+                last_export: Mutex::new(None),
+                published_status: Mutex::new(None),
+                last_queue_check: Mutex::new(None),
                 stop: Arc::new(AtomicBool::new(false)),
             });
             let s = state.clone();
@@ -860,7 +1087,7 @@ mod tests {
         assert_eq!(r.header("X-Plex-Client-Identifier"), Some("receiver-id"));
         let body = r.into_string().unwrap();
         assert!(body.contains("title=\"Pi &amp; DAC\""));
-        assert!(body.contains("protocolCapabilities=\"timeline,playback,playqueues\""));
+        assert!(body.contains("protocolCapabilities=\"timeline,playback,playqueues,playqueues-creation\""));
         let body = h
             .get("/player/timeline/poll?commandID=88")
             .call()
@@ -871,7 +1098,7 @@ mod tests {
             body.contains("commandID=\"0\""),
             "poll doesn't acknowledge an unexecuted command"
         );
-        assert!(body.contains("type=\"music\" state=\"stopped\""));
+        assert!(body.contains("type=\"music\" itemType=\"music\" state=\"stopped\""));
         assert!(!body.contains(",volume"));
         assert!(!body.contains("secret"));
         assert_eq!(
@@ -992,7 +1219,7 @@ mod tests {
         h.get("/player/playback/playMedia?machineIdentifier=pms-id&key=%2Flibrary%2Fmetadata%2F42&containerKey=%2FplayQueues%2F7%3Fown%3D1&offset=8500&address=example.org&token=untrusted&commandID=1")
             .call().unwrap();
         match h.commands.recv_timeout(Duration::from_secs(2)).unwrap() {
-            Cmd::PlayRemote { queue, offset } => {
+            Cmd::PlayRemote { queue, offset, .. } => {
                 assert_eq!(queue.selected, 1);
                 assert_eq!(queue.item_ids, [101, 102]);
                 assert_eq!(queue.info.version, 4);
@@ -1074,7 +1301,7 @@ mod tests {
         assert!(hello.starts_with("HELLO * HTTP/1.0\r\n"));
         assert!(hello.contains("Resource-Identifier: receiver-id\r\n"));
         assert!(hello.contains("Port: 32500\r\n"));
-        assert!(hello.contains("Protocol-Capabilities: timeline,playback,playqueues\r\n"));
+        assert!(hello.contains("Protocol-Capabilities: timeline,playback,playqueues,playqueues-creation\r\n"));
         assert!(!hello.contains("secret"));
         controller
             .send_to(b"M-SEARCH * HTTP/1.0\r\n\r\n", receiver_address)
