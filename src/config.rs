@@ -39,6 +39,8 @@ pub struct Config {
     pub companion_address: Option<std::net::Ipv4Addr>,
     /// Show the album cover as pixel art beside what's playing. Default: on.
     pub album_art: Option<bool>,
+    /// Show one line of Plex's timed lyrics above the progress bar. Default: off.
+    pub lyrics: Option<bool>,
     /// Color theme: a theme's name ("nord", "gruvbox-light"…), "terminal"
     /// for the terminal's own colors, or "auto" to follow the terminal's
     /// background. Default: Plext's own. `T` in Plext picks one.

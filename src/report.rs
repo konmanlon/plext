@@ -17,6 +17,7 @@ const INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct Reporter {
     stop: Arc<AtomicBool>,
+    companion_queues: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -24,14 +25,21 @@ impl Reporter {
     pub fn spawn(server: Server, status: Arc<Mutex<Status>>, session_id: String) -> Reporter {
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
+        let companion_queues = Arc::new(AtomicBool::new(false));
+        let queues = companion_queues.clone();
         let handle = thread::Builder::new()
             .name("plext-report".into())
-            .spawn(move || run(server, status, session_id, s))
+            .spawn(move || run(server, status, session_id, s, queues))
             .expect("failed to start reporter thread");
         Reporter {
             stop,
+            companion_queues,
             handle: Some(handle),
         }
+    }
+
+    pub fn use_companion_queues(&self) {
+        self.companion_queues.store(true, Ordering::Relaxed);
     }
 }
 
@@ -53,7 +61,7 @@ struct Last {
     started: u64,
 }
 
-fn run(server: Server, status: Arc<Mutex<Status>>, session_id: String, stop: Arc<AtomicBool>) {
+fn run(server: Server, status: Arc<Mutex<Status>>, session_id: String, stop: Arc<AtomicBool>, companion_queues: Arc<AtomicBool>) {
     let mut queues: HashMap<String, Option<PlayQueue>> = HashMap::new();
     let mut last: Option<Last> = None;
 
@@ -61,6 +69,7 @@ fn run(server: Server, status: Arc<Mutex<Status>>, session_id: String, stop: Arc
         let queue = track
             .album_key
             .as_ref()
+            .filter(|_| !companion_queues.load(Ordering::Relaxed))
             .and_then(|k| queues.get(k))
             .and_then(|q| q.as_ref());
         let t = Timeline {
@@ -107,7 +116,7 @@ fn run(server: Server, status: Arc<Mutex<Status>>, session_id: String, stop: Arc
                 }
             };
             if due {
-                if let Some(album) = track.album_key.as_ref().filter(|_| st.remote.is_none()) {
+                if let Some(album) = track.album_key.as_ref().filter(|_| st.remote.is_none() && !companion_queues.load(Ordering::Relaxed)) {
                     if !queues.contains_key(album) {
                         let q = server.create_play_queue(album).ok();
                         queues.insert(album.clone(), q);

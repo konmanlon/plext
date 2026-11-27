@@ -113,6 +113,23 @@ impl Queue {
     /// Replaces the queue with `tracks`, starting at `index`. With shuffle
     /// on, that track plays first and the rest follow in shuffled order.
     pub fn replace(&mut self, tracks: Vec<Track>, index: usize) {
+        // Picking another track from the same published source is a jump,
+        // not a new server queue. Keep entry/item IDs and the existing shuffle
+        // order so controllers can continue using their queue snapshot.
+        if self.remote.is_some() && !tracks.is_empty() && self.unshuffled.len() == tracks.len()
+            && self.unshuffled.iter().zip(&tracks).all(|(id, track)| {
+                self.items.iter().any(|e| e.id == *id && e.track.key == track.key)
+            }) {
+            let selected = self.unshuffled[index.min(tracks.len() - 1)];
+            for (id, track) in self.unshuffled.iter().zip(tracks) {
+                if let Some(entry) = self.items.iter_mut().find(|e| e.id == *id) {
+                    entry.track = track;
+                }
+            }
+            self.pos = self.items.iter().position(|e| e.id == selected).unwrap();
+            self.changed();
+            return;
+        }
         self.remote = None;
         self.items = self.entries(tracks);
         self.pos = index.min(self.items.len().saturating_sub(1));
@@ -153,6 +170,30 @@ impl Queue {
         self.remote = Some(pq.info);
         self.changed();
         refresh && old != self.current().and_then(|e| e.play_queue_item_id)
+    }
+
+    /// Attach a server representation without restarting or reordering local
+    /// playback. Reject a snapshot that became stale while PMS was loading.
+    pub fn bind_remote(&mut self, pq: crate::plex::RemoteQueue, expected_version: u64) -> bool {
+        if self.remote.is_some() || self.version != expected_version
+            || self.items.len() != pq.tracks.len() || self.items.len() != pq.item_ids.len()
+            || !self.items.iter().zip(&pq.tracks).all(|(e, t)| e.track.key == t.key) {
+            return false;
+        }
+        for (entry, item_id) in self.items.iter_mut().zip(pq.item_ids) {
+            entry.play_queue_item_id = Some(item_id);
+        }
+        self.remote = Some(pq.info);
+        self.changed();
+        true
+    }
+
+    pub fn invalidate_remote(&mut self, expected_id: u64) -> bool {
+        if self.remote.as_ref().map(|q| q.id) != Some(expected_id) { return false; }
+        self.remote = None;
+        for entry in &mut self.items { entry.play_queue_item_id = None; }
+        self.changed();
+        true
     }
 
     /// Forgets all but the last `keep` tracks already played (those before

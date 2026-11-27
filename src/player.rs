@@ -18,7 +18,10 @@ pub enum Cmd {
     /// Companion casts start at the supplied offset in one operation, before
     /// opening the output (rather than racing Play followed by SeekTo).
     PlayAt { queue: Vec<Track>, index: usize, offset: f64 },
-    PlayRemote { queue: crate::plex::RemoteQueue, offset: f64 },
+    PlayRemote { queue: crate::plex::RemoteQueue, offset: f64, paused: bool },
+    /// Publish the current local queue to Companion without replacing audio.
+    BindRemote { queue: crate::plex::RemoteQueue, expected_version: u64 },
+    InvalidateRemote(u64),
     RefreshRemote(crate::plex::RemoteQueue),
     /// Acknowledges commands previously consumed by the player thread.
     Barrier(Sender<()>),
@@ -300,10 +303,15 @@ impl Engine {
                     self.parked = None;
                     pending = self.play(offset);
                 }
-                Cmd::PlayRemote { queue, offset } => {
+                Cmd::PlayRemote { queue, offset, paused } => {
                     self.with_queue(|q| q.replace_remote(queue, false));
-                    self.parked = None;
-                    pending = self.play(offset);
+                    if paused {
+                        self.parked = Some(offset);
+                        self.show_idle();
+                    } else {
+                        self.parked = None;
+                        pending = self.play(offset);
+                    }
                 }
                 Cmd::Barrier(ack) => { let _ = ack.send(()); }
                 Cmd::TogglePause | Cmd::Resume => {
@@ -348,7 +356,9 @@ impl Engine {
                 }
             }
             self.publish();
-            self.show_idle();
+            if pending.is_none() {
+                self.show_idle();
+            }
         }
     }
 
@@ -358,7 +368,7 @@ impl Engine {
         if !is_edit(&cmd) {
             return Err(cmd);
         }
-        let gone = apply_edit(&self.queue, cmd);
+        let gone = apply_edit(&self.queue, &self.status, cmd);
         self.publish();
         Ok(gone)
     }
@@ -522,9 +532,16 @@ impl Engine {
         // Release the DAC so other programs can use it while we're idle.
         self.out = None;
         self.set(|s| {
-            s.state = PlayState::Stopped;
             s.output = None;
-            s.pos = 0.0;
+            if matches!(&pending, Some(Cmd::Play { .. } | Cmd::PlayAt { .. } | Cmd::PlayRemote { .. } | Cmd::Restore(_))) {
+                // A controller may poll before metadata for the replacement
+                // has loaded. Keep the current item while handing over;
+                // publishing a stop here can trigger a controller's teardown.
+                s.state = PlayState::Loading;
+            } else {
+                s.state = PlayState::Stopped;
+                s.pos = 0.0;
+            }
         });
         pending
     }
@@ -554,7 +571,7 @@ impl Engine {
                 }
                 Cmd::Jump(id) => moved |= self.with_queue(|q| q.jump(id)),
                 c if is_edit(&c) => {
-                    moved |= apply_edit(&self.queue, c);
+                    moved |= apply_edit(&self.queue, &self.status, c);
                     self.publish();
                 }
                 // Pausing or seeking applies to a track that's playing.
@@ -744,7 +761,7 @@ impl Engine {
                     c @ (Cmd::Play { .. } | Cmd::PlayAt { .. } | Cmd::PlayRemote { .. } | Cmd::Quit) => return End::Command(c),
                     Cmd::Barrier(ack) => { let _ = ack.send(()); }
                     edit => {
-                        let gone = apply_edit(&self.queue, edit);
+                        let gone = apply_edit(&self.queue, &self.status, edit);
                         publish(&self.queue, &self.status);
                         if gone {
                             return End::Reload;
@@ -871,13 +888,30 @@ fn is_edit(cmd: &Cmd) -> bool {
             | Cmd::CycleRepeat
             | Cmd::SetRepeat(_)
             | Cmd::RefreshRemote(_)
+            | Cmd::BindRemote { .. }
+            | Cmd::InvalidateRemote(_)
     )
 }
 
 /// Applies a queue edit to the shared queue. Returns true when it removed
 /// the track that was current. Commands that aren't edits are ignored.
-fn apply_edit(queue: &Arc<Mutex<Queue>>, cmd: Cmd) -> bool {
+fn apply_edit(queue: &Arc<Mutex<Queue>>, status: &Arc<Mutex<Status>>, cmd: Cmd) -> bool {
     let mut q = queue.lock().unwrap();
+    if let Cmd::InvalidateRemote(id) = cmd {
+        if q.invalidate_remote(id) {
+            status.lock().unwrap().remote = None;
+        }
+        return false;
+    }
+    if let Cmd::BindRemote { queue, expected_version } = cmd {
+        if q.bind_remote(queue, expected_version) {
+            let mut st = status.lock().unwrap();
+            if st.track.as_ref().map(|t| &t.key) == q.current().map(|e| &e.track.key) {
+                st.remote = remote_position(&q);
+            }
+        }
+        return false;
+    }
     if !matches!(cmd, Cmd::SetRepeat(_) | Cmd::CycleRepeat | Cmd::RefreshRemote(_)) {
         q.remote = None;
     }
@@ -938,7 +972,7 @@ mod tests {
             info: crate::plex::RemoteQueueInfo { id: 7, version: 1 },
             tracks, item_ids: vec![101, 102, 103], selected: 1, shuffled: false,
         };
-        let seen = watch(&player, 10, Cmd::PlayRemote { queue, offset: 0.1 }, |p| {
+        let seen = watch(&player, 10, Cmd::PlayRemote { queue, offset: 0.1, paused: false }, |p| {
             assert_eq!(p.status().remote.as_ref().unwrap().item_id, 102);
         });
         assert_eq!(seen, ["b", "c"]);

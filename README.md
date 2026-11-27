@@ -37,6 +37,8 @@ Raspberry Pi.
   and the now-playing bar. Ratings are shared with Plex and Plexamp.
 - **Album art as pixel art.** The playing album's cover, drawn right in the terminal beside
   what's playing, square in whatever font you use.
+- **Single-line lyrics from Plex.** Timed lyrics follow the playing track above the progress
+  bar when the terminal has room for the album cover.
 - **Desktop media controls (MPRIS).** Plext shows up in your desktop's media controls (GNOME's
   top bar and lock screen, KDE's media applet) with the track and album cover, and the keyboard's
   play/pause, next and previous keys control it.
@@ -330,6 +332,15 @@ It looks best in a terminal with 24-bit color (GNOME Terminal, Konsole, kitty, W
 Alacritty, foot…); elsewhere Plext uses the nearest of the standard 256 colors. With
 `album_art = false`, Plext always uses the compact bar.
 
+## Lyrics
+
+When the album cover layout is visible, Plext shows the current lyric line centered above the progress bar.
+Lyrics come only from streams supplied by your Plex server; Plext never searches or contacts
+an external lyrics service. If Plex has no usable timed lyrics, the line stays blank.
+
+Lyrics are disabled by default. To enable them, add `lyrics = true` to the top-level settings in `~/.config/plext/config.toml`.
+They remain hidden in the compact layout and when `album_art = false`.
+
 ## Volume
 
 In **desktop-sound mode**, `<` and `>` turn Plext's own volume down and up in 5% steps (up to
@@ -491,6 +502,7 @@ holds your Plex sign-in token, so Plext keeps it readable only by you.
 | `report_playback` | `true` | Report playback to Plex (dashboard, history, webhooks) |
 | `group_releases` | `true` | Group an artist's releases under headings (Albums, EPs, Live…). With `false`, they're one list, oldest first |
 | `album_art` | `true` | Show the album cover as pixel art in a taller now-playing area |
+| `lyrics` | `false` | Enable the current line of Plex's timed lyrics when the cover layout is visible |
 | `mpris` | `true` | Show in the desktop's media controls and obey media keys |
 | `theme` | `plext` | Color theme: a theme's name, `terminal` or `auto` (see [Themes](#themes)); `T` sets it |
 | `theme_background` | `true` | Themes paint their own background; `false` keeps your terminal's |
